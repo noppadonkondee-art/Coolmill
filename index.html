@@ -235,25 +235,40 @@ function iou(a,b){
 function updateTracks(dets){
   const used = new Set();
   for (const t of tracks){
-    let best = -1, bestIou = 0.25;
+    // ทำนายว่าเฟรมนี้ควรอยู่ตรงไหน จากความเร็วเดิม (สำคัญมากตอน fps ต่ำ)
+    const px = t.cx + t.vx, py = t.cy + t.vy;
+    const pbox = [t.box[0] + t.vx, t.box[1] + t.vy, t.box[2], t.box[3]];
+
+    let best = -1, bestScore = 0;
     dets.forEach((d,i) => {
       if (used.has(i) || d.cls !== t.cls) return;
-      const s = iou(t.box, d.box);
-      if (s > bestIou){ bestIou = s; best = i; }
+      const ov = iou(pbox, d.box);
+      const dist = Math.hypot(px - d.cx, py - d.cy);
+      const reach = Math.max(d.box[2], d.box[3], t.box[2], t.box[3]) * 1.6;  // ยอมให้กระโดดได้ไกลขึ้น
+      if (ov < 0.08 && dist > reach) return;
+      const score = ov + Math.max(0, 1 - dist / reach) * 0.8;
+      if (score > bestScore){ bestScore = score; best = i; }
     });
+
     if (best >= 0){
       const d = dets[best]; used.add(best);
       t.prev = { x:t.cx, y:t.cy };
+      t.vx = t.vx * 0.5 + (d.cx - t.cx) * 0.5;
+      t.vy = t.vy * 0.5 + (d.cy - t.cy) * 0.5;
       t.box = d.box; t.cx = d.cx; t.cy = d.cy; t.missed = 0;
       t.path.push({ x:d.cx, y:d.cy });
       if (t.path.length > 40) t.path.shift();
     } else {
+      // หายชั่วคราว (โดนบัง): เดินตำแหน่งต่อด้วยความเร็วเดิม แทร็กจะไม่ขาด
       t.missed++;
+      t.prev = { x:t.cx, y:t.cy };
+      t.cx += t.vx; t.cy += t.vy;
+      t.box = [t.box[0] + t.vx, t.box[1] + t.vy, t.box[2], t.box[3]];
     }
   }
   dets.forEach((d,i) => {
     if (used.has(i)) return;
-    tracks.push({ id:nextId++, cls:d.cls, box:d.box, cx:d.cx, cy:d.cy, prev:null,
+    tracks.push({ id:nextId++, cls:d.cls, box:d.box, cx:d.cx, cy:d.cy, prev:null, vx:0, vy:0,
                   path:[{x:d.cx,y:d.cy}], missed:0, counted:false,
                   pending:false, entryVec:null, crossAt:null, mv:null, logIdx:-1 });
   });
@@ -387,7 +402,7 @@ async function loop(){
   if (!busy){
     busy = true;
     try {
-      const preds = await model.detect(video, 20, parseFloat($('conf').value));
+      const preds = await model.detect(video, 50, parseFloat($('conf').value));
       const heavy = $('heavy').checked;
       const dets = [];
       for (const p of preds){
@@ -406,7 +421,7 @@ async function loop(){
       const now = performance.now();
       if (lastT){
         fpsAvg = fpsAvg ? fpsAvg*0.8 + (1000/(now-lastT))*0.2 : 1000/(now-lastT);
-        $('fps').textContent = fpsAvg.toFixed(1) + ' fps';
+        $('fps').textContent = fpsAvg.toFixed(1) + ' fps · เจอ ' + dets.length + ' · แทร็ก ' + tracks.length;
       }
       lastT = now;
     } catch(e){
