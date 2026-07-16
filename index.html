@@ -1,9 +1,10 @@
+```html
 <!DOCTYPE html>
 <html lang="th">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>ตัวนับจราจร — คน / รถยนต์ / มอเตอร์ไซค์</title>
+<title>ตัวนับจราจร Pro (WebGPU + YOLO)</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans+Thai:wght@400;500;600&display=swap" rel="stylesheet">
@@ -48,6 +49,7 @@
   .hint{
     position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
     text-align:center;color:var(--muted);font-size:14px;line-height:1.7;padding:20px;max-width:320px;
+    z-index:10;
   }
 
   .tally{display:flex;gap:3px;align-items:flex-end;height:16px;padding:6px 14px 0;overflow:hidden}
@@ -89,14 +91,14 @@
 
 <div class="bar">
   <span class="dot" id="dot"></span>
-  <span id="status">พร้อมเริ่ม — กดปุ่ม “เริ่มนับ”</span>
+  <span id="status">กำลังเริ่มต้นระบบ...</span>
   <span id="fps"></span>
 </div>
 
 <div class="stage" id="stage">
   <video id="video" playsinline muted autoplay></video>
   <canvas id="canvas"></canvas>
-  <div class="hint" id="hint">เล็งกล้องไปที่ถนนหรือทางเดิน แล้วกด “เริ่มนับ”<br>ลากเส้นสีเขียวไปวางตรงจุดที่ต้องการนับ</div>
+  <div class="hint" id="hint">ระบบกำลังตรวจสอบความพร้อม WebGPU...<br>กรุณารอโหลดไลบรารีเบื้องหลังสักครู่</div>
 </div>
 
 <div class="tally" id="tally"></div>
@@ -121,13 +123,13 @@
 
 <div class="controls">
   <div class="row">
-    <button class="primary" id="btnStart">เริ่มนับ</button>
+    <button class="primary" id="btnStart" disabled>เริ่มนับ</button>
     <button id="btnFlip" disabled>สลับกล้อง</button>
     <button id="btnReset" disabled>ล้างยอด</button>
     <button id="btnCsv" disabled>ส่งออก CSV</button>
   </div>
   <div class="row">
-    <button id="btnFile">ใช้ไฟล์วิดีโอแทนกล้อง</button>
+    <button id="btnFile" disabled>ใช้ไฟล์วิดีโอแทนกล้อง</button>
     <input type="file" id="fileIn" accept="video/*" hidden>
   </div>
   <details>
@@ -145,8 +147,8 @@
       </select>
     </div>
     <div class="set">
-      <label for="conf">ความมั่นใจขั้นต่ำ <span id="confVal">0.45</span></label>
-      <input type="range" id="conf" min="0.2" max="0.8" step="0.05" value="0.45">
+      <label for="conf">ความมั่นใจขั้นต่ำ <span id="confVal">0.30</span></label>
+      <input type="range" id="conf" min="0.15" max="0.8" step="0.05" value="0.30">
     </div>
     <div class="set">
       <label for="ang">มุมขั้นต่ำที่ถือว่าเลี้ยว <span id="angVal">30</span>°</label>
@@ -154,23 +156,36 @@
     </div>
     <div class="set">
       <label for="heavy">นับรถบัส/รถบรรทุก เป็นรถยนต์</label>
-      <input type="checkbox" id="heavy">
+      <input type="checkbox" id="heavy" checked>
     </div>
   </details>
 </div>
 
+<!-- โหลด ONNX Runtime Web แบบ WebGPU -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.webgpu.min.js"></script>
+
 <script>
+// แมป YOLO COCO Class IDs ไปยังกลุ่มที่เราต้องการแสดง
+// COCO class index: 0 = person, 2 = car, 3 = motorcycle, 5 = bus, 7 = truck
+const COCO_CLASSES = {
+  0: 'person',
+  2: 'car',
+  3: 'motorcycle',
+  5: 'bus',
+  7: 'truck'
+};
+
 const CLASSES = {
   person:     { th:'คน',           color:'#FFC857' },
   car:        { th:'รถยนต์',        color:'#2EC4F1' },
   motorcycle: { th:'มอเตอร์ไซค์',   color:'#FF4D6D' }
 };
-const HEAVY = ['bus','truck'];
 
 const $ = id => document.getElementById(id);
 const video = $('video'), canvas = $('canvas'), ctx = canvas.getContext('2d');
 
-let model = null, running = false, busy = false;
+let session = null;
+let running = false, busy = false;
 let facing = 'environment', stream = null;
 let linePos = 0.5, dragging = false;
 let tracks = [], nextId = 1;
@@ -181,117 +196,231 @@ const MV_ICON = { s:'↑', l:'↰', r:'↱' };
 let log = [];
 let lastT = 0, fpsAvg = 0;
 
-/* ---------- โหลดไลบรารี (ลองหลาย CDN) ---------- */
-function loadScript(urls){
-  return new Promise((resolve, reject) => {
-    let i = 0;
-    const next = () => {
-      if (i >= urls.length) return reject(new Error('โหลดไลบรารีไม่สำเร็จ'));
-      const s = document.createElement('script');
-      s.src = urls[i++];
-      s.onload = resolve;
-      s.onerror = next;
-      document.head.appendChild(s);
-    };
-    next();
-  });
-}
-async function loadModel(){
-  setStatus('กำลังโหลดโมเดลตรวจจับ… (ครั้งแรกใช้เน็ตราว 5–10 MB)');
-  await loadScript([
-    'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js',
-    'https://cdnjs.cloudflare.com/ajax/libs/tensorflow/4.22.0/tf.min.js',
-    'https://unpkg.com/@tensorflow/tfjs@4.22.0/dist/tf.min.js'
-  ]);
-  await loadScript([
-    'https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3',
-    'https://unpkg.com/@tensorflow-models/coco-ssd@2.2.3'
-  ]);
-  model = await cocoSsd.load({ base:'lite_mobilenet_v2' });
+// โหลดโมเดล YOLO11n / YOLO26n ONNX (แปลงมาสำหรับการใช้งาน Web)
+const MODEL_URL = 'https://huggingface.co/Nomis/YOLO-ByteTrack-ONNX-Web/resolve/main/public/models/yolo11n.onnx';
+
+window.onload = async () => {
+  try {
+    setStatus('ตรวจสอบเบราว์เซอร์และเตรียมพร้อมโมเดล...');
+    
+    // ตั้งพิกัดสำหรับ Web Assembly (WASM) ในกรณีที่ WebGPU ค้างหรือตกแต่งไม่ทัน
+    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
+
+    // เลือกรันโมเดล WebGPU หากฮาร์ดแวร์รองรับ มิฉะนั้นจะเปลี่ยนเป็น WASM อัตโนมัติ
+    let provider = 'wasm';
+    if (navigator.gpu) {
+      provider = 'webgpu';
+      setStatus('ตรวจพบ WebGPU! กำลังโหลดโมเดล YOLOv11/12 (ขนาด ~11MB)...');
+    } else {
+      setStatus('ไม่พบ WebGPU (จะใช้โหมด WASM CPU เเทน) กำลังโหลดโมเดล...');
+    }
+
+    // ดาวน์โหลดและสร้าง Session ในการรันโมเดลผ่าน ORT
+    session = await ort.InferenceSession.create(MODEL_URL, {
+      executionProviders: [provider, 'wasm']
+    });
+
+    setStatus('ดาวน์โหลดและประมวลผลโมเดลเสร็จเรียบร้อย! พร้อมใช้งาน');
+    $('hint').innerHTML = 'โหลดโมเดลเสร็จสมบูรณ์แล้ว!<br>เล็งกล้องไปที่ถนน แล้วกด “เริ่มนับ”<br>ลากเส้นสีเขียวไปวางตรงจุดที่ต้องการนับ';
+    $('btnStart').disabled = false;
+    $('btnFile').disabled = false;
+  } catch (err) {
+    console.error(err);
+    setStatus('เกิดข้อผิดพลาดในการโหลดโมเดล: ' + err.message);
+    $('hint').innerHTML = 'เกิดข้อผิดพลาดในการตั้งค่าระบบอัจฉริยะ:<br><span style="color:#FF4D6D;font-size:12px;">' + err.message + '</span>';
+  }
+};
+
+/* ---------- ตัวดึงพิกเซลมาเปลี่ยนเป็น Float32 Tensor ขนาด 640x640 (สำหรับ YOLO) ---------- */
+function preprocess(canvasElement) {
+  const targetSize = 640;
+  
+  // บีบหรือดึงภาพลง Canvas ชั่วคราวเพื่อทำ Resize ให้อยู่ในขนาด 640x640
+  const offscreen = document.createElement('canvas');
+  offscreen.width = targetSize;
+  offscreen.height = targetSize;
+  const oCtx = offscreen.getContext('2d');
+  oCtx.drawImage(canvasElement, 0, 0, targetSize, targetSize);
+  
+  const imgData = oCtx.getImageData(0, 0, targetSize, targetSize);
+  const data = imgData.data;
+
+  // จัดโครงสร้างข้อมูลแบบ NCHW (1, 3, 640, 640) และทำการหารสีเฉลี่ย 255.0
+  const floatData = new Float32Array(3 * targetSize * targetSize);
+  for (let i = 0; i < targetSize * targetSize; i++) {
+    floatData[i] = data[i * 4] / 255.0;                      // R
+    floatData[i + targetSize * targetSize] = data[i * 4 + 1] / 255.0;  // G
+    floatData[i + 2 * targetSize * targetSize] = data[i * 4 + 2] / 255.0; // B
+  }
+  
+  return new ort.Tensor('float32', floatData, [1, 3, targetSize, targetSize]);
 }
 
-/* ---------- กล้อง ---------- */
-async function startCamera(){
-  if (stream) stream.getTracks().forEach(t => t.stop());
-  stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode:{ ideal: facing }, width:{ ideal:1280 }, height:{ ideal:720 } },
-    audio: false
-  });
-  video.srcObject = stream;
-  await video.play();
-  video.style.opacity = 1;
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-}
-
-/* ---------- ตัวติดตามวัตถุแบบง่าย (IoU matching) ---------- */
-function iou(a,b){
-  const x1 = Math.max(a[0],b[0]), y1 = Math.max(a[1],b[1]);
+/* ---------- อัลกอริทึมคัดกรองกรอบกล่องแบบทับซ้อน Non-Maximum Suppression (NMS) ---------- */
+function iou(a, b) {
+  const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]);
   const x2 = Math.min(a[0]+a[2], b[0]+b[2]), y2 = Math.min(a[1]+a[3], b[1]+b[3]);
-  const w = Math.max(0,x2-x1), h = Math.max(0,y2-y1);
-  const inter = w*h;
+  const w = Math.max(0, x2 - x1), h = Math.max(0, y2 - y1);
+  const inter = w * h;
   return inter / (a[2]*a[3] + b[2]*b[3] - inter + 1e-6);
 }
+
+function runNMS(boxes, scores, classIds, iouThreshold = 0.45) {
+  const indices = Array.from({length: boxes.length}, (_, i) => i);
+  // เรียงลำดับความมั่นใจจากมากไปหาน้อย
+  indices.sort((a, b) => scores[b] - scores[a]);
+  
+  const keep = [];
+  while (indices.length > 0) {
+    const current = indices.shift();
+    keep.push(current);
+    for (let i = 0; i < indices.length; i++) {
+      if (classIds[current] === classIds[indices[i]]) {
+        const ov = iou(boxes[current], boxes[indices[i]]);
+        if (ov > iouThreshold) {
+          indices.splice(i, 1);
+          i--;
+        }
+      }
+    }
+  }
+  return keep.map(idx => ({ box: boxes[idx], score: scores[idx], classId: classIds[idx] }));
+}
+
+/* ---------- ดำเนินการคัดกรองผลลัพธ์ของโมเดล YOLO ---------- */
+function postprocess(outputTensor, width, height, minConf) {
+  // YOLOv11/12 จะมีรูปเเบบ Output ขนาด [1, 84, 8400]
+  // 84 แถวแรกประกอบด้วย (cx, cy, w, h) และ Class Scores อีก 80 คลาส
+  // 8400 คือจำนวน Grid-box ที่ทำนายออกมา
+  const data = outputTensor.data;
+  const numRows = outputTensor.dims[1]; // 84
+  const numCols = outputTensor.dims[2]; // 8400
+  
+  const rawBoxes = [];
+  const rawScores = [];
+  const rawClasses = [];
+
+  const scaleX = width / 640;
+  const scaleY = height / 640;
+
+  for (let c = 0; c < numCols; c++) {
+    // หาคะแนนความมั่นใจสูงสุดของ Object คลาสต่างๆ
+    let maxScore = 0;
+    let bestClassId = -1;
+    
+    // สแกนตรวจสอบเฉพาะกลุ่มคลาสเป้าหมาย คน, รถยนต์, มอเตอร์ไซค์, รถบัส, รถบรรทุก
+    for (const [id, label] of Object.entries(COCO_CLASSES)) {
+      const idx = parseInt(id);
+      const score = data[(4 + idx) * numCols + c];
+      if (score > maxScore) {
+        maxScore = score;
+        bestClassId = idx;
+      }
+    }
+
+    if (maxScore > minConf && bestClassId !== -1) {
+      // แปลงพิกัดแบบ Normalized กลับคืนมาเป็นพิกัดภาพพิกเซล
+      const cx = data[0 * numCols + c] * scaleX;
+      const cy = data[1 * numCols + c] * scaleY;
+      const w = data[2 * numCols + c] * scaleX;
+      const h = data[3 * numCols + c] * scaleY;
+      
+      const x = cx - w / 2;
+      const y = cy - h / 2;
+
+      rawBoxes.push([x, y, w, h]);
+      rawScores.push(maxScore);
+      rawClasses.push(bestClassId);
+    }
+  }
+
+  // เรียกใช้ NMS เพื่อสกัดกรอบที่ซ้อนกันเป็นกลุ่มเดียว
+  return runNMS(rawBoxes, rawScores, rawClasses);
+}
+
+/* ---------- อัปเดตและเก็บข้อมูลการเคลื่อนที่ของแต่ละวัตถุ (Object Tracking) ---------- */
 function updateTracks(dets){
   const used = new Set();
+  
   for (const t of tracks){
-    // ทำนายว่าเฟรมนี้ควรอยู่ตรงไหน จากความเร็วเดิม (สำคัญมากตอน fps ต่ำ)
-    const px = t.cx + t.vx, py = t.cy + t.vy;
-    const pbox = [t.box[0] + t.vx, t.box[1] + t.vy, t.box[2], t.box[3]];
+    // คาดเดาพิกัดจากความเร็วเฟรมเดิม (Velocity Tracking) เพื่อป้องกันกล่องกะพริบหรือหายไปตอนคนบัง
+    const px = t.cx + (t.vx * 1.3); 
+    const py = t.cy + (t.vy * 1.3);
+    const pbox = [t.box[0] + (t.vx * 1.3), t.box[1] + (t.vy * 1.3), t.box[2], t.box[3]];
 
     let best = -1, bestScore = 0;
-    dets.forEach((d,i) => {
+    
+    dets.forEach((d, i) => {
       if (used.has(i) || d.cls !== t.cls) return;
       const ov = iou(pbox, d.box);
       const dist = Math.hypot(px - d.cx, py - d.cy);
-      const reach = Math.max(d.box[2], d.box[3], t.box[2], t.box[3]) * 1.6;  // ยอมให้กระโดดได้ไกลขึ้น
-      if (ov < 0.08 && dist > reach) return;
-      const score = ov + Math.max(0, 1 - dist / reach) * 0.8;
+      
+      const reach = Math.max(d.box[2], d.box[3], t.box[2], t.box[3]) * 2.8; 
+      
+      if (ov < 0.04 && dist > reach) return;
+      
+      // คำนวณคะแนนสำหรับการจับคู่วัตถุเฟรมเก่ากับเฟรมใหม่
+      const score = (ov * 0.45) + (Math.max(0, 1 - dist / reach) * 0.55);
       if (score > bestScore){ bestScore = score; best = i; }
     });
 
     if (best >= 0){
       const d = dets[best]; used.add(best);
       t.prev = { x:t.cx, y:t.cy };
-      t.vx = t.vx * 0.5 + (d.cx - t.cx) * 0.5;
-      t.vy = t.vy * 0.5 + (d.cy - t.cy) * 0.5;
+      t.vx = t.vx * 0.35 + (d.cx - t.cx) * 0.65;
+      t.vy = t.vy * 0.35 + (d.cy - t.cy) * 0.65;
       t.box = d.box; t.cx = d.cx; t.cy = d.cy; t.missed = 0;
       t.path.push({ x:d.cx, y:d.cy });
-      if (t.path.length > 40) t.path.shift();
+      if (t.path.length > 50) t.path.shift();
     } else {
-      // หายชั่วคราว (โดนบัง): เดินตำแหน่งต่อด้วยความเร็วเดิม แทร็กจะไม่ขาด
+      // วัตถุถูกบัง: ไหลกล่องต่อไปข้างหน้าชั่วคราวก่อนสลายตัวไป
       t.missed++;
       t.prev = { x:t.cx, y:t.cy };
+      t.vx *= 0.8; 
+      t.vy *= 0.8;
       t.cx += t.vx; t.cy += t.vy;
       t.box = [t.box[0] + t.vx, t.box[1] + t.vy, t.box[2], t.box[3]];
     }
   }
-  dets.forEach((d,i) => {
+
+  dets.forEach((d, i) => {
     if (used.has(i)) return;
-    tracks.push({ id:nextId++, cls:d.cls, box:d.box, cx:d.cx, cy:d.cy, prev:null, vx:0, vy:0,
-                  path:[{x:d.cx,y:d.cy}], missed:0, counted:false,
-                  pending:false, entryVec:null, crossAt:null, mv:null, logIdx:-1 });
+    tracks.push({ 
+      id:nextId++, cls:d.cls, box:d.box, cx:d.cx, cy:d.cy, 
+      prev:null, vx:0, vy:0, path:[{x:d.cx, y:d.cy}], 
+      missed:0, counted:false, pending:false, 
+      entryVec:null, crossAt:null, mv:null, logIdx:-1 
+    });
   });
-  // แทร็กที่หายไปแล้ว: ตัดสินทิศทางด้วยข้อมูลเท่าที่มี ก่อนทิ้ง
-  tracks.filter(t => t.missed >= 8 && t.pending).forEach(t => resolveMove(t, true));
-  tracks = tracks.filter(t => t.missed < 8);
+
+  // ถือว่าสิ้นสุดการติดตามเมื่อไม่พบวัตถุนานเกิน 25 เฟรม
+  tracks.filter(t => t.missed >= 25 && t.pending).forEach(t => resolveMove(t, true));
+  tracks = tracks.filter(t => t.missed < 25);
 }
+
 function checkCrossing(){
   const axis = $('axis').value, dir = $('dir').value;
   const limit = axis === 'h' ? canvas.height * linePos : canvas.width * linePos;
+  
   for (const t of tracks){
     if (t.counted || !t.prev) continue;
     const before = axis === 'h' ? t.prev.y : t.prev.x;
     const after  = axis === 'h' ? t.cy    : t.cx;
+    
+    // ตั้งค่า Buffer กันการตีกลับกระตุกบริเวณเส้นนับ
+    const isCrossing = (before < limit - 4 && after >= limit + 4) || (before > limit + 4 && after <= limit - 4);
+    if (!isCrossing) continue;
+
     const fwd = before < limit && after >= limit;
     const bwd = before > limit && after <= limit;
-    if (!fwd && !bwd) continue;
+    
     if (dir === 'fwd' && !fwd) continue;
     if (dir === 'bwd' && !bwd) continue;
+    
     t.counted = true;
     t.pending = true;
     t.crossAt = { x:t.cx, y:t.cy };
-    t.entryVec = headingVec(t.path);       // ทิศตอนเข้าเส้น
+    t.entryVec = headingVec(t.path);       
     totals[t.cls]++;
     t.logIdx = log.length;
     log.push({ t:new Date().toISOString(), cls:t.cls, dir: fwd ? 'fwd' : 'bwd', mv:null });
@@ -300,9 +429,8 @@ function checkCrossing(){
   }
 }
 
-/* เวกเตอร์ทิศทางล่าสุด: จากจุดเก่าที่ห่างพอ → จุดปัจจุบัน */
 function headingVec(path, minLen){
-  const min = minLen || 6;
+  const min = minLen || 10;
   const last = path[path.length-1];
   for (let i = path.length - 2; i >= 0; i--){
     const dx = last.x - path[i].x, dy = last.y - path[i].y;
@@ -311,19 +439,18 @@ function headingVec(path, minLen){
   return null;
 }
 
-/* จำแนก ตรงไป / เลี้ยวซ้าย / เลี้ยวขวา จากมุมที่ทิศทางเปลี่ยนไปหลังข้ามเส้น */
 function resolveMove(t, force){
   if (!t.pending) return;
   const dist = t.crossAt ? Math.hypot(t.cx - t.crossAt.x, t.cy - t.crossAt.y) : 0;
-  const need = Math.max(canvas.width, canvas.height) * 0.22;
+  const need = Math.max(canvas.width, canvas.height) * 0.16;
   if (!force && dist < need) return;
 
-  const v1 = t.entryVec, v2 = headingVec(t.path, 8);
+  const v1 = t.entryVec, v2 = headingVec(t.path, 12);
   let m = 's';
   if (v1 && v2){
-    let cross = v1.x*v2.y - v1.y*v2.x;
-    const dot = v1.x*v2.x + v1.y*v2.y;
-    if (facing === 'user') cross = -cross;          // กล้องหน้าภาพกลับด้าน
+    let cross = v1.x * v2.y - v1.y * v2.x;
+    const dot = v1.x * v2.x + v1.y * v2.y;
+    if (facing === 'user') cross = -cross;          
     const deg = Math.atan2(cross, dot) * 180 / Math.PI;
     const th = parseFloat($('ang').value);
     if (deg > th) m = 'r';
@@ -333,8 +460,9 @@ function resolveMove(t, force){
   t.mv = m;
   mv[t.cls][m]++;
   if (t.logIdx >= 0) log[t.logIdx].mv = m;
-  $(({s:'s',l:'l',r:'r'})[m] + '-' + t.cls).textContent = mv[t.cls][m];
+  $(({s:'s', l:'l', r:'r'})[m] + '-' + t.cls).textContent = mv[t.cls][m];
 }
+
 function addTick(cls){
   const strip = $('tally');
   const el = document.createElement('span');
@@ -344,12 +472,12 @@ function addTick(cls){
   while (strip.children.length > 60) strip.removeChild(strip.firstChild);
 }
 
-/* ---------- วาดภาพ ---------- */
+/* ---------- การวาดผลลัพธ์ลงบนแคนวาส ---------- */
 function draw(){
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
   const axis = $('axis').value;
 
-  // เส้นนับ
+  // วาดเส้นแนวแบ่งการนับ
   ctx.save();
   ctx.strokeStyle = '#7CFFB2';
   ctx.lineWidth = Math.max(2, canvas.width/300);
@@ -365,21 +493,24 @@ function draw(){
   ctx.stroke();
   ctx.restore();
 
-  // กรอบวัตถุ
-  const fs = Math.max(12, canvas.width/45);
+  // วาดกรอบสแกนตรวจจับ
+  const fs = Math.max(12, canvas.width/55);
   ctx.font = `600 ${fs}px 'IBM Plex Sans Thai', sans-serif`;
   ctx.textBaseline = 'top';
+  
   for (const t of tracks){
-    if (t.missed > 0) continue;
+    if (t.missed > 5) ctx.globalAlpha = Math.max(0.15, 1 - (t.missed / 25));
+    else ctx.globalAlpha = 1;
+    
     const c = CLASSES[t.cls].color;
     ctx.strokeStyle = c;
-    ctx.lineWidth = Math.max(2, canvas.width/320);
+    ctx.lineWidth = Math.max(2, canvas.width/400);
     ctx.strokeRect(t.box[0], t.box[1], t.box[2], t.box[3]);
 
-    // เส้นทางที่วิ่งมา (ช่วยดูว่าเลี้ยวจริงไหม)
     if (t.path.length > 2){
       ctx.save();
-      ctx.globalAlpha = .55; ctx.setLineDash([]); ctx.strokeStyle = c; ctx.lineWidth = 2;
+      ctx.globalAlpha = t.missed > 0 ? 0.15 : 0.55;
+      ctx.setLineDash([]); ctx.strokeStyle = c; ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.moveTo(t.path[0].x, t.path[0].y);
       for (let i = 1; i < t.path.length; i++) ctx.lineTo(t.path[i].x, t.path[i].y);
@@ -394,38 +525,60 @@ function draw(){
     ctx.fillStyle = '#0E1216';
     ctx.fillText(label, t.box[0] + 5, Math.max(0, t.box[1] - fs - 3));
   }
+  ctx.globalAlpha = 1;
 }
 
-/* ---------- ลูปตรวจจับ ---------- */
+/* ---------- ลูปสำหรับรันโมเดล YOLO ถี่ตามความเร็วจอ ---------- */
 async function loop(){
   if (!running) return;
   if (!busy){
     busy = true;
     try {
-      const preds = await model.detect(video, 50, parseFloat($('conf').value));
+      // ดำเนินการ Preprocess เฟรมภาพปัจจุบัน
+      const inputTensor = preprocess(canvas);
+      
+      // ป้อน Tensor ไปรันผ่านโครงข่าย YOLO (WebGPU-Accelerated)
+      const outputs = await session.run({ images: inputTensor });
+      
+      // ดึงคีย์ผลลัพธ์แรกออกมาทำงานต่อ
+      const outputKey = Object.keys(outputs)[0];
+      const results = postprocess(outputs[outputKey], canvas.width, canvas.height, parseFloat($('conf').value));
+      
       const heavy = $('heavy').checked;
       const dets = [];
-      for (const p of preds){
-        let cls = p.class;
-        if (heavy && HEAVY.includes(cls)) cls = 'car';
-        if (!CLASSES[cls]) continue;
-        dets.push({ cls, box:p.bbox, cx:p.bbox[0] + p.bbox[2]/2, cy:p.bbox[1] + p.bbox[3]/2 });
+      
+      for (const r of results) {
+        let rawCls = COCO_CLASSES[r.classId];
+        // แปลงประเภทรถบัส/รถบรรทุก เป็นรถยนต์ทั่วไปหากเปิดใช้งานการจัดกลุ่ม
+        if (heavy && (rawCls === 'bus' || rawCls === 'truck')) rawCls = 'car';
+        
+        if (CLASSES[rawCls]) {
+          dets.push({
+            cls: rawCls,
+            box: r.box,
+            cx: r.box[0] + r.box[2]/2,
+            cy: r.box[1] + r.box[3]/2
+          });
+        }
       }
+
+      // นำข้อมูลจุดที่ผ่านการสกัดแล้วอัปเดตโมดูลการติดตามทิศทาง
       updateTracks(dets);
       checkCrossing();
       tracks.forEach(t => resolveMove(t, false));
+      
       const live = { person:0, car:0, motorcycle:0 };
       dets.forEach(d => live[d.cls]++);
       for (const k in live) $('live-' + k).textContent = 'ในภาพ ' + live[k];
 
       const now = performance.now();
       if (lastT){
-        fpsAvg = fpsAvg ? fpsAvg*0.8 + (1000/(now-lastT))*0.2 : 1000/(now-lastT);
-        $('fps').textContent = fpsAvg.toFixed(1) + ' fps · เจอ ' + dets.length + ' · แทร็ก ' + tracks.length;
+        fpsAvg = fpsAvg ? fpsAvg*0.85 + (1000/(now-lastT))*0.15 : 1000/(now-lastT);
+        $('fps').textContent = fpsAvg.toFixed(1) + ' fps · ตรวจจับ ' + dets.length + ' · แทร็ก ' + tracks.length;
       }
       lastT = now;
     } catch(e){
-      console.error(e);
+      console.error('Inference Error:', e);
     }
     busy = false;
   }
@@ -433,7 +586,7 @@ async function loop(){
   requestAnimationFrame(loop);
 }
 
-/* ---------- ลากเส้นนับ ---------- */
+/* ---------- ตัวคุมพิกัดเลื่อนเส้นกั้น ---------- */
 const stage = $('stage');
 function movLine(e){
   const r = stage.getBoundingClientRect();
@@ -448,13 +601,26 @@ stage.addEventListener('pointerdown', e => { dragging = true; movLine(e); });
 stage.addEventListener('pointermove', e => { if (dragging) movLine(e); });
 window.addEventListener('pointerup', () => dragging = false);
 
-/* ---------- ปุ่มต่าง ๆ ---------- */
+/* ---------- การควบคุมกล้องและพาร์ทควบคุม UI ---------- */
 function setStatus(s, live){
   $('status').textContent = s;
   $('dot').classList.toggle('live', !!live);
 }
 $('conf').addEventListener('input', e => $('confVal').textContent = parseFloat(e.target.value).toFixed(2));
 $('ang').addEventListener('input', e => $('angVal').textContent = e.target.value);
+
+async function startCamera(){
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode:{ ideal: facing }, width:{ ideal:1280 }, height:{ ideal:720 } },
+    audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+  video.style.opacity = 1;
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+}
 
 $('btnStart').onclick = async () => {
   if (running){
@@ -465,29 +631,28 @@ $('btnStart').onclick = async () => {
   }
   $('btnStart').disabled = true;
   try {
-    if (!model) await loadModel();
     setStatus('กำลังขอสิทธิ์ใช้กล้อง…');
     await startCamera();
     $('hint').style.display = 'none';
     running = true;
     ['btnFlip','btnReset','btnCsv'].forEach(id => $(id).disabled = false);
     $('btnStart').textContent = 'หยุด';
-    setStatus('กำลังนับ — ลากเส้นเขียวไปวางจุดที่ต้องการ', true);
+    setStatus('กำลังนับด้วย YOLO — เล็งกล้องไปจุดที่ต้องการ', true);
     loop();
   } catch(err){
-    setStatus('เริ่มไม่ได้: ' + err.message);
+    setStatus('เปิดกล้องไม่ได้: ' + err.message);
     $('hint').innerHTML = 'เปิดกล้องไม่ได้<br><span style="font-size:12px">' + err.message +
-      '<br><br>กล้องใช้ได้เฉพาะหน้าเว็บที่เปิดผ่าน https หรือ localhost และต้องอนุญาตสิทธิ์กล้องในเบราว์เซอร์</span>';
+      '<br><br>ตรวจสอบว่าหน้าเว็บเปิดด้วย HTTPS และอนุญาตสิทธิ์การใช้งานกล้องในเบราว์เซอร์แล้ว</span>';
     $('hint').style.display = 'block';
   }
   $('btnStart').disabled = false;
 };
+
 $('btnFile').onclick = () => $('fileIn').click();
 $('fileIn').onchange = async (e) => {
   const f = e.target.files[0];
   if (!f) return;
   try {
-    if (!model) await loadModel();
     if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
     video.srcObject = null;
     video.src = URL.createObjectURL(f);
@@ -502,16 +667,18 @@ $('fileIn').onchange = async (e) => {
     ['btnFlip','btnReset','btnCsv'].forEach(id => $(id).disabled = false);
     $('btnFlip').disabled = true;
     $('btnStart').textContent = 'หยุด';
-    setStatus('กำลังนับจากไฟล์วิดีโอ', true);
+    setStatus('กำลังประมวลผลวิดีโอด้วย YOLO WebGPU', true);
     loop();
   } catch(err){
     setStatus('เล่นไฟล์ไม่ได้: ' + err.message);
   }
 };
+
 $('btnFlip').onclick = async () => {
   facing = facing === 'environment' ? 'user' : 'environment';
   try { await startCamera(); tracks = []; } catch(e){ setStatus('สลับกล้องไม่ได้: ' + e.message); }
 };
+
 $('btnReset').onclick = () => {
   totals = { person:0, car:0, motorcycle:0 };
   mv = { person:{s:0,l:0,r:0}, car:{s:0,l:0,r:0}, motorcycle:{s:0,l:0,r:0} };
@@ -523,6 +690,7 @@ $('btnReset').onclick = () => {
   $('tally').innerHTML = '';
   setStatus('ล้างยอดแล้ว เริ่มนับใหม่จาก 0', running);
 };
+
 $('btnCsv').onclick = () => {
   if (!log.length) return setStatus('ยังไม่มีข้อมูลให้ส่งออก', running);
   const rows = ['เวลา,ประเภท,ข้ามเส้นทาง,การเลี้ยว'];
@@ -533,10 +701,12 @@ $('btnCsv').onclick = () => {
   const blob = new Blob(['\uFEFF' + rows.join('\n')], { type:'text/csv;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'traffic-count-' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.csv';
+  a.download = 'traffic-yolo-count-' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.csv';
   a.click();
   URL.revokeObjectURL(a.href);
 };
 </script>
 </body>
 </html>
+
+```
